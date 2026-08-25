@@ -1,0 +1,26 @@
+{
+  "cancelled": false,
+  "elapsed_seconds": 836.68,
+  "photos": {
+    "discovered": 3424,
+    "new_or_changed": 3063,
+    "deleted": 0,
+    "processed": 3061,
+    "failed": 2,
+    "detected_faces": 2176
+  },
+  "references": {
+    "sync": {
+      "discovered": 8,
+      "new_or_changed": 0,
+      "deleted": 0
+    },
+    "process": {
+      "processed": 0,
+      "failed": 0,
+      "detected_faces": 0,
+      "cancelled": false
+    }
+  },
+  "detected_faces_total": 2176
+}

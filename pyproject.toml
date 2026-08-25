@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faceid-local-app"
+version = "0.1.0"
+description = "Application locale d'identification faciale avec indexation incrémentale et interface graphique."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "GitHub Copilot" }
+]
+dependencies = [
+  "PySide6>=6.8",
+  "Pillow>=10.4",
+  "numpy>=2.1",
+  "insightface>=0.7.3",
+  "onnxruntime>=1.20"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3"
+]
+
+[project.scripts]
+faceid-app = "faceid_app.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
