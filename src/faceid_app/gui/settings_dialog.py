@@ -51,6 +51,8 @@ class SettingsDialog(QDialog):
 
     def _build_ui(self) -> None:
         root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(20, 20, 20, 20)
+        root_layout.setSpacing(16)
 
         help_text = QLabel(
             "Configure les sources et le stockage. Le stockage est obligatoire. "

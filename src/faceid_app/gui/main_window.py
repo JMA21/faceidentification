@@ -3,20 +3,19 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import QAbstractListModel, QEvent, QModelIndex, QRect, QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtWidgets import QCompleter
-
-from faceid_app import __version__
-from PySide6.QtGui import QMouseEvent, QPainter, QPixmap, QStandardItem, QStandardItemModel
+from PySide6.QtGui import QColor, QImageReader, QMouseEvent, QPainter, QPixmap, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QCompleter,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QListView,
     QMainWindow,
     QMessageBox,
@@ -25,20 +24,22 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStyle,
     QStyledItemDelegate,
-    QTextEdit,
+    QPlainTextEdit,
     QVBoxLayout,
     QWidget,
     QComboBox,
 )
 
+from faceid_app import __version__
 from faceid_app.config.settings import AppSettings
 from faceid_app.core.face_engine import detect_engine_version
-from faceid_app.core.matcher import FaceMatcher
-from faceid_app.models import MatchCandidate
+from faceid_app.models import MatchCandidate, SearchResult
 from faceid_app.storage.database import initialize_database, resolve_database_path, connect
 from faceid_app.storage.repositories import FaceIndexRepository
 from faceid_app.gui.indexing_worker import IndexingWorker
 from faceid_app.gui.settings_dialog import SettingsDialog
+from faceid_app.gui.search_worker import SearchWorker
+from faceid_app.gui.theme import APP_STYLESHEET
 
 
 class SearchResultsModel(QAbstractListModel):
@@ -52,7 +53,8 @@ class SearchResultsModel(QAbstractListModel):
         super().__init__(parent)
         self._matches: list[MatchCandidate] = []
         self._icon_size = QSize(icon_size)
-        self._thumbnail_cache: dict[str, QPixmap] = {}
+        self._thumbnail_cache: OrderedDict[str, QPixmap] = OrderedDict()
+        self._thumbnail_cache_limit = 128
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # type: ignore[override]
         if parent.isValid():
@@ -65,7 +67,10 @@ class SearchResultsModel(QAbstractListModel):
         match = self._matches[index.row()]
 
         if role == Qt.ItemDataRole.DisplayRole:
-            return f"{match.person_name} | similarité={match.similarity:.3f}"
+            source = "validation manuelle" if match.source == "manual" else "détection automatique"
+            return f"{match.person_name}  ·  Similarité {match.similarity:.3f}  ·  {source}"
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return str(match.photo_path)
         if role == self.MATCH_ROLE:
             return match
         if role == self.FILE_NAME_ROLE:
@@ -95,17 +100,22 @@ class SearchResultsModel(QAbstractListModel):
     def _get_thumbnail(self, photo_path: Path) -> QPixmap | None:
         key = str(photo_path)
         if key in self._thumbnail_cache:
+            self._thumbnail_cache.move_to_end(key)
             return self._thumbnail_cache[key]
-        pixmap = QPixmap(key)
-        if pixmap.isNull():
-            self._thumbnail_cache[key] = QPixmap()
-            return None
-        scaled = pixmap.scaled(
-            self._icon_size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        reader = QImageReader(key)
+        reader.setAutoTransform(True)
+        original_size = reader.size()
+        if original_size.isValid():
+            reader.setScaledSize(original_size.scaled(self._icon_size, Qt.AspectRatioMode.KeepAspectRatio))
+        image = reader.read()
+        scaled = QPixmap()
+        if not image.isNull():
+            scaled = QPixmap.fromImage(image).scaled(
+                self._icon_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            )
         self._thumbnail_cache[key] = scaled
+        while len(self._thumbnail_cache) > self._thumbnail_cache_limit:
+            self._thumbnail_cache.popitem(last=False)
         return scaled
 
 
@@ -115,15 +125,18 @@ class SearchResultDelegate(QStyledItemDelegate):
     def __init__(self, icon_size: QSize, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._icon_size = QSize(icon_size)
-        self._outer_padding = 6
-        self._line_spacing = 3
+        self._outer_padding = 12
+        self._line_spacing = 6
 
     def paint(self, painter: QPainter, option, index: QModelIndex) -> None:  # type: ignore[override]
         painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        if is_selected:
-            painter.fillRect(option.rect, option.palette.highlight())
+        card_rect = option.rect.adjusted(1, 1, -1, -1)
+        painter.setPen(QColor("#bad0f4") if is_selected else QColor("#e3eaf4"))
+        painter.setBrush(QColor("#eaf2ff") if is_selected else QColor("#f8fafd"))
+        painter.drawRoundedRect(card_rect, 10, 10)
 
         content_rect = option.rect.adjusted(
             self._outer_padding,
@@ -134,6 +147,9 @@ class SearchResultDelegate(QStyledItemDelegate):
 
         thumb_rect = QRect(content_rect.topLeft(), self._icon_size)
         thumb_rect.moveTop(content_rect.top() + max(0, (content_rect.height() - self._icon_size.height()) // 2))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#e4ebf5"))
+        painter.drawRoundedRect(thumb_rect, 6, 6)
 
         thumbnail = index.data(SearchResultsModel.THUMBNAIL_ROLE)
         if isinstance(thumbnail, QPixmap) and not thumbnail.isNull():
@@ -148,8 +164,8 @@ class SearchResultDelegate(QStyledItemDelegate):
             content_rect.height(),
         )
 
-        normal_pen = option.palette.highlightedText().color() if is_selected else option.palette.text().color()
-        link_pen = option.palette.link().color()
+        normal_pen = QColor("#243247")
+        link_pen = QColor("#2563eb")
 
         title = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
         file_name = str(index.data(SearchResultsModel.FILE_NAME_ROLE) or "")
@@ -159,13 +175,13 @@ class SearchResultDelegate(QStyledItemDelegate):
         y = text_rect.top() + line_height
 
         painter.setPen(normal_pen)
-        painter.drawText(text_rect.left(), y, title)
+        painter.drawText(text_rect.left(), y, option.fontMetrics.elidedText(title, Qt.TextElideMode.ElideRight, text_rect.width()))
         y += line_height + self._line_spacing
-        painter.drawText(text_rect.left(), y, f"Fichier: {file_name}")
+        painter.drawText(text_rect.left(), y, option.fontMetrics.elidedText(f"Fichier : {file_name}", Qt.TextElideMode.ElideMiddle, text_rect.width()))
         y += line_height + self._line_spacing
 
         painter.setPen(link_pen)
-        painter.drawText(text_rect.left(), y, f"Chemin: {full_path}")
+        painter.drawText(text_rect.left(), y, option.fontMetrics.elidedText(f"Chemin : {full_path}", Qt.TextElideMode.ElideMiddle, text_rect.width()))
 
         painter.restore()
 
@@ -179,6 +195,8 @@ class SearchResultDelegate(QStyledItemDelegate):
         if event.type() != QEvent.Type.MouseButtonRelease:
             return super().editorEvent(event, model, option, index)
         if not isinstance(event, QMouseEvent):
+            return super().editorEvent(event, model, option, index)
+        if event.button() != Qt.MouseButton.LeftButton:
             return super().editorEvent(event, model, option, index)
 
         content_rect = option.rect.adjusted(
@@ -214,6 +232,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = AppSettings.load()
         self.setWindowTitle("Face ID Local App")
+        self.setStyleSheet(APP_STYLESHEET)
         self.resize(self.settings.window.width, self.settings.window.height)
 
         self.person_combo = QComboBox()
@@ -227,18 +246,33 @@ class MainWindow(QMainWindow):
         completer.setCompletionRole(Qt.ItemDataRole.DisplayRole)
         self.person_combo.setCompleter(completer)
         self.results_list = QListView()
+        self.results_list.setObjectName("results")
         self._result_icon_size = QSize(160, 120)
         self.results_list.setIconSize(self._result_icon_size)
         self.results_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.results_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.results_list.setUniformItemSizes(True)
+        self.results_list.setLayoutMode(QListView.LayoutMode.Batched)
+        self.results_list.setBatchSize(100)
+        self.results_list.setSpacing(4)
+        self.results_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self._search_results_model = SearchResultsModel(icon_size=self._result_icon_size, parent=self)
         self.results_list.setModel(self._search_results_model)
         self._search_result_delegate = SearchResultDelegate(icon_size=self._result_icon_size, parent=self.results_list)
         self.results_list.setItemDelegate(self._search_result_delegate)
         self._search_result_delegate.pathClicked.connect(self._open_file_in_explorer_from_string)
-        self.results_count_label = QLabel("0 match")
+        self.results_count_label = QLabel("0 résultat")
+        self.results_count_label.setObjectName("resultCount")
         self.threshold_display_label = QLabel()
-        self.log_output = QTextEdit()
+        self.threshold_display_label.setObjectName("searchInfo")
+        self.threshold_display_label.setWordWrap(True)
+        self.empty_results_label = QLabel("Choisissez une personne, puis lancez une recherche.")
+        self.empty_results_label.setObjectName("emptyState")
+        self.empty_results_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_results_label.setWordWrap(True)
+        self.log_output = QPlainTextEdit()
+        self.log_output.setObjectName("journal")
+        self.log_output.setMaximumBlockCount(1500)
         self.log_output.setReadOnly(True)
         self.status_label = QLabel("Prêt")
         self.face_count_label = QLabel("Visages détectés: 0")
@@ -247,15 +281,19 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         self._indexing_thread: QThread | None = None
         self._indexing_worker: IndexingWorker | None = None
-        self._last_search_matches: list[object] = []
+        self._search_thread: QThread | None = None
+        self._search_worker: SearchWorker | None = None
+        self._last_search_matches: list[MatchCandidate] = []
         self._last_search_person: str = ""
         self._settings_dialog: SettingsDialog | None = None
 
         self._build_ui()
+        self._update_result_actions()
         self._refresh_threshold_display()
         self._load_people_from_storage()
-        self.person_combo.setCurrentIndex(-1)
-        self.person_combo.setEditText("")
+        if not self.settings.last_selected_person:
+            self.person_combo.setCurrentIndex(-1)
+            self.person_combo.setEditText("")
         self._refresh_engine_info()
         self._open_settings_if_required()
 
@@ -264,29 +302,49 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
 
         root_layout = QVBoxLayout(central_widget)
+        root_layout.setContentsMargins(22, 16, 22, 16)
+        root_layout.setSpacing(14)
+        header = QHBoxLayout()
+        heading = QVBoxLayout()
+        title = QLabel("Face ID")
+        title.setObjectName("appTitle")
+        subtitle = QLabel("Retrouvez vos proches dans vos photos · Traitement local")
+        subtitle.setObjectName("subtitle")
+        heading.addWidget(title)
+        heading.addWidget(subtitle)
+        header.addLayout(heading, 1)
+        version = QLabel(f"v{__version__} · Local")
+        version.setObjectName("versionBadge")
+        header.addWidget(version)
+        root_layout.addLayout(header)
         splitter = QSplitter(Qt.Orientation.Vertical)
         root_layout.addWidget(splitter)
 
-        top_widget = QWidget()
+        top_widget = QFrame()
+        top_widget.setObjectName("card")
         top_layout = QVBoxLayout(top_widget)
+        top_layout.setContentsMargins(16, 16, 16, 16)
+        top_layout.setSpacing(12)
         splitter.addWidget(top_widget)
 
         button_row = QHBoxLayout()
         self.settings_button = QPushButton("Paramètres…")
         self.settings_button.clicked.connect(self._open_settings_dialog)
-        self.index_button = QPushButton("Indexer photos + références")
+        self.index_button = QPushButton("Indexer les sources")
         self.index_button.clicked.connect(self._run_indexing)
-        self.rerun_incremental_button = QPushButton("Rerun incrémental")
+        self.rerun_incremental_button = QPushButton("Actualiser l’index")
+        self.rerun_incremental_button.setToolTip("Analyser uniquement les nouveaux fichiers ou les fichiers modifiés")
         self.rerun_incremental_button.clicked.connect(self._run_incremental_indexing)
-        self.cancel_index_button = QPushButton("Annuler l'indexation")
+        self.cancel_index_button = QPushButton("Annuler")
         self.cancel_index_button.clicked.connect(self._cancel_indexing)
         self.cancel_index_button.setEnabled(False)
-        self.version_button = QPushButton("Tester la version moteur")
+        self.version_button = QPushButton("Version du moteur")
         self.version_button.clicked.connect(self._show_engine_version_details)
         button_row.addWidget(self.settings_button)
         button_row.addWidget(self.index_button)
         button_row.addWidget(self.rerun_incremental_button)
         button_row.addWidget(self.cancel_index_button)
+        button_row.addStretch(1)
         button_row.addWidget(self.version_button)
         top_layout.addLayout(button_row)
 
@@ -298,35 +356,48 @@ class MainWindow(QMainWindow):
 
         search_controls = QHBoxLayout()
         search_controls.addWidget(QLabel("Personne"))
-        search_controls.addWidget(self.person_combo)
+        search_controls.addWidget(self.person_combo, 1)
         self.search_button = QPushButton("Rechercher")
+        self.search_button.setProperty("primary", True)
         self.search_button.clicked.connect(self._run_search)
+        self.person_combo.lineEdit().returnPressed.connect(self.search_button.click)
         self.export_photos_button = QPushButton("Exporter photos")
         self.export_photos_button.clicked.connect(self._export_search_photos)
         self.validate_button = QPushButton("Valider")
         self.validate_button.clicked.connect(lambda: self._apply_validation("confirmed"))
-        self.reject_button = QPushButton("Dévalider")
+        self.reject_button = QPushButton("Rejeter")
         self.reject_button.clicked.connect(lambda: self._apply_validation("rejected"))
         self.manual_button = QPushButton("Marquer manuel")
+        self.manual_button.setToolTip("Marquer la suggestion comme manuelle ; le seuil de recherche reste appliqué")
         self.manual_button.clicked.connect(lambda: self._apply_validation("manual"))
         search_controls.addWidget(self.search_button)
-        search_controls.addWidget(self.export_photos_button)
-        search_controls.addWidget(self.validate_button)
-        search_controls.addWidget(self.reject_button)
-        search_controls.addWidget(self.manual_button)
         search_layout.addLayout(search_controls)
         search_layout.addWidget(self.threshold_display_label)
-        search_layout.addWidget(self.results_count_label)
-        search_layout.addWidget(self.results_list)
+        result_actions = QHBoxLayout()
+        result_actions.addWidget(self.results_count_label)
+        result_actions.addStretch(1)
+        result_actions.addWidget(self.validate_button)
+        result_actions.addWidget(self.reject_button)
+        result_actions.addWidget(self.manual_button)
+        result_actions.addWidget(self.export_photos_button)
+        search_layout.addLayout(result_actions)
+        search_layout.addWidget(self.empty_results_label)
+        search_layout.addWidget(self.results_list, 1)
 
         self.results_list.selectionModel().selectionChanged.connect(self._show_selected_result_details)
+        self.results_list.selectionModel().selectionChanged.connect(self._update_result_actions)
 
         bottom_widget = QWidget()
         bottom_layout = QVBoxLayout(bottom_widget)
         splitter.addWidget(bottom_widget)
-        bottom_layout.addWidget(QLabel("Journal"))
+        bottom_layout.setContentsMargins(0, 8, 0, 0)
+        journal_title = QLabel("Journal d’activité")
+        journal_title.setObjectName("sectionTitle")
+        bottom_layout.addWidget(journal_title)
         bottom_layout.addWidget(self.log_output)
-        splitter.setSizes([620, 240])
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([620, 140])
 
         status_bar = self.statusBar()
         status_bar.addWidget(self.status_label, 1)
@@ -352,8 +423,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._open_settings_dialog)
 
     def _open_settings_dialog(self) -> None:
-        if self._indexing_thread is not None:
-            QMessageBox.information(self, "Indexation en cours", "Modifie les paramètres après la fin de l'indexation.")
+        if self._indexing_thread is not None or self._search_thread is not None:
+            QMessageBox.information(self, "Traitement en cours", "Modifiez les paramètres après la fin du traitement.")
             return
 
         if self._settings_dialog is None:
@@ -375,7 +446,17 @@ class MainWindow(QMainWindow):
             self.settings.storage_directory != previous_storage
             or self.settings.reference_directory != previous_reference
         ):
+            self._clear_search_results()
             self._load_people_from_storage()
+
+    def _clear_search_results(self) -> None:
+        self._search_results_model.clear()
+        self._last_search_matches.clear()
+        self._last_search_person = ""
+        self.results_count_label.setText("0 résultat")
+        self.empty_results_label.setText("Choisissez une personne, puis lancez une recherche.")
+        self.empty_results_label.show()
+        self._update_result_actions()
 
     def _persist_window_and_selection_state(self) -> None:
         self.settings.window.width = self.width()
@@ -389,24 +470,26 @@ class MainWindow(QMainWindow):
         repository = self._open_repository_if_possible()
         if repository is None:
             return
-        for row in repository.list_people():
-            name = str(row["display_name"])
-            self.person_combo.addItem(name)
-            self._person_completer_model.appendRow(QStandardItem(name))
+        try:
+            for row in repository.list_people():
+                name = str(row["display_name"])
+                self.person_combo.addItem(name)
+                self._person_completer_model.appendRow(QStandardItem(name))
+        finally:
+            repository.connection.close()
         if self.settings.last_selected_person:
             index = self.person_combo.findText(self.settings.last_selected_person)
             if index >= 0:
                 self.person_combo.setCurrentIndex(index)
 
     def _refresh_engine_info(self) -> None:
-        info = detect_engine_version()
+        info = detect_engine_version(check_updates=False)
         providers = ", ".join(info.providers)
         status = "disponible" if info.available else "indisponible"
         self._log(
             f"App v{__version__} | {info.engine_name} {status} | installé: insightface={info.package_version or 'non installé'}, "
-            f"onnxruntime={info.runtime_version or 'non installé'} | compatible: insightface={info.latest_compatible_package_version or 'inconnue'}, "
-            f"onnxruntime={info.latest_compatible_runtime_version or 'inconnue'} | PyPI: insightface={info.latest_package_version or 'inconnue'}, "
-            f"onnxruntime={info.latest_runtime_version or 'inconnue'} | providers={providers}"
+            f"onnxruntime={info.runtime_version or 'non installé'} | providers={providers}. "
+            "Vérification des mises à jour disponible via « Version du moteur »."
         )
         self._set_status(f"App {__version__} / {info.engine_name} {info.package_version}")
 
@@ -465,6 +548,8 @@ class MainWindow(QMainWindow):
             self.version_button.setEnabled(True)
 
     def _run_indexing(self) -> None:
+        if self._search_thread is not None:
+            return
         if self._indexing_thread is not None:
             self._log("Une indexation est déjà en cours.")
             self._set_status("Indexation déjà en cours…")
@@ -503,11 +588,15 @@ class MainWindow(QMainWindow):
         self._indexing_worker.completed.connect(self._on_indexing_completed)
         self._indexing_worker.cancelled.connect(self._on_indexing_cancelled)
         self._indexing_worker.failed.connect(self._on_indexing_failed)
+        self._indexing_worker.completed.connect(self._indexing_worker.deleteLater)
+        self._indexing_worker.cancelled.connect(self._indexing_worker.deleteLater)
+        self._indexing_worker.failed.connect(self._indexing_worker.deleteLater)
         self._indexing_worker.completed.connect(self._indexing_thread.quit)
         self._indexing_worker.cancelled.connect(self._indexing_thread.quit)
         self._indexing_worker.failed.connect(self._indexing_thread.quit)
         self._indexing_thread.finished.connect(self._cleanup_indexing_thread)
 
+        self._clear_search_results()
         self._set_controls_enabled(False)
         self.cancel_index_button.setEnabled(True)
         self._set_status("Préparation de l'indexation…")
@@ -555,12 +644,11 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Indexation impossible", error_message)
 
     def _cleanup_indexing_thread(self) -> None:
-        if self._indexing_worker is not None:
-            self._indexing_worker.deleteLater()
-            self._indexing_worker = None
+        self._indexing_worker = None
         if self._indexing_thread is not None:
             self._indexing_thread.deleteLater()
             self._indexing_thread = None
+        self._set_controls_enabled(True)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         widgets = (
@@ -579,6 +667,15 @@ class MainWindow(QMainWindow):
         for widget in widgets:
             widget.setEnabled(enabled)
         self.settings_menu_action.setEnabled(enabled)
+        if enabled:
+            self._update_result_actions()
+
+    def _update_result_actions(self, *_args) -> None:
+        idle = self._indexing_thread is None and self._search_thread is None
+        selected = self._search_results_model.match_at(self.results_list.currentIndex()) is not None
+        for button in (self.validate_button, self.reject_button, self.manual_button):
+            button.setEnabled(idle and selected)
+        self.export_photos_button.setEnabled(idle and bool(self._last_search_matches))
 
     def _set_status(self, message: str) -> None:
         self.status_label.setText(message)
@@ -628,8 +725,10 @@ class MainWindow(QMainWindow):
         self._log(f"Résumé d'indexation exporté: {summary_path}")
 
     def _run_search(self) -> None:
-        repository = self._open_repository_if_possible()
-        if repository is None:
+        if self._search_thread is not None or self._indexing_thread is not None:
+            return
+        storage = self.settings.storage_directory.strip()
+        if not storage or not resolve_database_path(storage).exists():
             QMessageBox.warning(self, "Stockage manquant", "Choisissez d'abord un emplacement de stockage.")
             return
         person_name = self.person_combo.currentText().strip()
@@ -637,15 +736,46 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Aucune personne", "Aucune personne de référence n'est encore indexée.")
             return
 
-        matcher = FaceMatcher(repository)
-        result = matcher.search_person(person_name, self.settings.similarity_threshold)
+        self._search_thread = QThread(self)
+        self._search_worker = SearchWorker(resolve_database_path(storage), person_name, self.settings.similarity_threshold)
+        self._search_worker.moveToThread(self._search_thread)
+        self._search_thread.started.connect(self._search_worker.run)
+        self._search_worker.completed.connect(self._on_search_completed)
+        self._search_worker.failed.connect(self._on_search_failed)
+        self._search_worker.completed.connect(self._search_thread.quit)
+        self._search_worker.failed.connect(self._search_thread.quit)
+        self._search_worker.completed.connect(self._search_worker.deleteLater)
+        self._search_worker.failed.connect(self._search_worker.deleteLater)
+        self._search_thread.finished.connect(self._cleanup_search_thread)
+        self._set_controls_enabled(False)
+        self._set_status(f"Recherche de {person_name}…")
+        self._update_progress(0, 0)
+        self._search_thread.start()
+
+    def _on_search_completed(self, result: SearchResult) -> None:
+        person_name = result.person_name
         self._last_search_matches = list(result.matches)
         self._last_search_person = person_name
         self._search_results_model.set_matches(result.matches)
         match_count = len(result.matches)
-        self.results_count_label.setText(f"{match_count} match{'es' if match_count > 1 else ''}")
+        self.results_count_label.setText(f"{match_count} résultat{'s' if match_count > 1 else ''}")
+        self.empty_results_label.setText("Aucune correspondance à ce seuil. Essayez un seuil plus bas dans les paramètres.")
+        self.empty_results_label.setVisible(match_count == 0)
         self._log(f"Recherche '{person_name}': {len(result.matches)} résultat(s) au seuil {result.threshold:.2f}")
         self._set_status(f"Recherche terminée pour {person_name}: {len(result.matches)} résultat(s).")
+
+    def _on_search_failed(self, message: str) -> None:
+        self._log(f"Erreur de recherche : {message}")
+        self._set_status("Recherche en erreur.")
+        QMessageBox.warning(self, "Recherche impossible", message)
+
+    def _cleanup_search_thread(self) -> None:
+        self._search_worker = None
+        if self._search_thread is not None:
+            self._search_thread.deleteLater()
+            self._search_thread = None
+        self._reset_progress()
+        self._set_controls_enabled(True)
 
     def _open_file_in_explorer_from_string(self, file_path: str) -> None:
         self._open_file_in_explorer(Path(file_path))
@@ -726,16 +856,20 @@ class MainWindow(QMainWindow):
             index += 1
 
     def _apply_validation(self, state: str) -> None:
-        repository = self._open_repository_if_possible()
         selected_index = self.results_list.currentIndex()
-        if repository is None or not selected_index.isValid():
-            return
         match = self._search_results_model.match_at(selected_index)
         if match is None:
             return
-        repository.set_validation(match.person_id, match.photo_face_id, state)
-        repository.commit()
+        repository = self._open_repository_if_possible()
+        if repository is None:
+            return
+        try:
+            repository.set_validation(match.person_id, match.photo_face_id, state)
+            repository.commit()
+        finally:
+            repository.connection.close()
         self._log(f"Validation mise à jour: {match.person_name} / face #{match.photo_face_id} -> {state}")
+        self._run_search()
 
     def _show_selected_result_details(self, *_args) -> None:
         selected_index = self.results_list.currentIndex()
@@ -768,11 +902,11 @@ class MainWindow(QMainWindow):
 
     def _log(self, message: str) -> None:
         safe_message = str(message).encode("utf-8", errors="replace").decode("utf-8")
-        self.log_output.append(safe_message)
+        self.log_output.appendPlainText(safe_message)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        if self._indexing_thread is not None:
-            QMessageBox.information(self, "Indexation en cours", "Patientez jusqu'à la fin de l'indexation avant de fermer l'application.")
+        if self._indexing_thread is not None or self._search_thread is not None:
+            QMessageBox.information(self, "Traitement en cours", "Patientez jusqu'à la fin du traitement avant de fermer l'application.")
             event.ignore()
             return
         self._persist_window_and_selection_state()

@@ -175,7 +175,7 @@ class IndexingWorker(QObject):
                     self.cancelled.emit(summary)
                     return
 
-            version_info = detect_engine_version()
+            version_info = detect_engine_version(check_updates=False)
             repository.save_engine_metadata(
                 {
                     "engine_name": version_info.engine_name,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable
+from itertools import islice
 
 import numpy as np
 
@@ -30,30 +30,43 @@ class FaceMatcher:
         if not reference_embeddings:
             return SearchResult(person_name=person_name, threshold=threshold, matches=[])
 
+        references = np.stack(reference_embeddings)
+        reference_norms = np.linalg.norm(references, axis=1)
+        validation_states = self.repository.get_validation_states(person_id)
         matches: list[MatchCandidate] = []
-        for photo_face_id, photo_path, bbox, photo_embedding in self.repository.iter_photo_faces():
-            validation_state = self.repository.get_validation_state(person_id, photo_face_id)
-            if validation_state == "rejected":
-                continue
+        faces = iter(self.repository.iter_photo_faces())
+        while batch := list(islice(faces, 256)):
+            embeddings = np.stack([face[3] for face in batch])
+            denominators = np.linalg.norm(embeddings, axis=1)[:, None] * reference_norms[None, :]
+            similarities = np.zeros((len(batch), len(references)), dtype=np.float32)
+            np.divide(embeddings @ references.T, denominators, out=similarities, where=denominators != 0)
+            best_similarities = similarities.max(axis=1)
+            near_threshold = np.isclose(best_similarities, threshold, rtol=1e-6, atol=1e-6)
 
-            best_similarity = max(
-                cosine_similarity(reference_embedding, photo_embedding)
-                for reference_embedding in reference_embeddings
-            )
-            if best_similarity < threshold and validation_state != "confirmed":
-                continue
-
-            matches.append(
-                MatchCandidate(
-                    person_id=person_id,
-                    person_name=person_name,
-                    photo_face_id=photo_face_id,
-                    photo_path=photo_path,
-                    similarity=best_similarity,
-                    bbox=bbox,
-                    source="manual" if validation_state in {"confirmed", "manual"} else "automatic",
+            for (photo_face_id, photo_path, bbox, embedding), similarity, needs_exact_score in zip(
+                batch, best_similarities, near_threshold
+            ):
+                validation_state = validation_states.get(photo_face_id)
+                if validation_state == "rejected":
+                    continue
+                best_similarity = float(similarity)
+                # BLAS reductions can round differently from the original scalar dot product.
+                # Preserve the exact inclusion decision at the threshold, not just close scores.
+                if needs_exact_score:
+                    best_similarity = max(cosine_similarity(reference, embedding) for reference in reference_embeddings)
+                if best_similarity < threshold and validation_state != "confirmed":
+                    continue
+                matches.append(
+                    MatchCandidate(
+                        person_id=person_id,
+                        person_name=person_name,
+                        photo_face_id=photo_face_id,
+                        photo_path=photo_path,
+                        similarity=best_similarity,
+                        bbox=bbox,
+                        source="manual" if validation_state in {"confirmed", "manual"} else "automatic",
+                    )
                 )
-            )
 
         matches.sort(key=lambda item: item.similarity, reverse=True)
         search_run_id = self.repository.create_search_run(person_id, threshold)

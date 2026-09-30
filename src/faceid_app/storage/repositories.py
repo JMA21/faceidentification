@@ -22,21 +22,19 @@ class FaceIndexRepository:
         self.connection = connection
 
     def upsert_photo_root(self, root_path: Path) -> int:
-        self.connection.execute(
-            "INSERT OR IGNORE INTO photo_roots(path) VALUES (?)",
-            (str(root_path),),
-        )
         row = self.connection.execute(
             "SELECT id FROM photo_roots WHERE path = ?",
             (str(root_path),),
         ).fetchone()
-        assert row is not None
-        return int(row["id"])
+        if row is not None:
+            return int(row["id"])
+        cursor = self.connection.execute("INSERT INTO photo_roots(path) VALUES (?)", (str(root_path),))
+        return int(cursor.lastrowid)
 
     def upsert_photo(self, root_path: Path, photo_path: Path, size_bytes: int, modified_time_ns: int, fingerprint: str) -> tuple[int, bool]:
         root_id = self.upsert_photo_root(root_path)
         row = self.connection.execute(
-            "SELECT id, fingerprint FROM photos WHERE path = ?",
+            "SELECT id, root_id, fingerprint, status FROM photos WHERE path = ?",
             (str(photo_path),),
         ).fetchone()
         if row is None:
@@ -50,10 +48,9 @@ class FaceIndexRepository:
             return int(cursor.lastrowid), True
 
         changed = str(row["fingerprint"]) != fingerprint
-        status = "pending" if changed else self.connection.execute(
-            "SELECT status FROM photos WHERE id = ?",
-            (int(row["id"]),),
-        ).fetchone()["status"]
+        if not changed and int(row["root_id"]) == root_id:
+            return int(row["id"]), False
+        status = "pending" if changed else row["status"]
         self.connection.execute(
             """
             UPDATE photos
@@ -104,19 +101,23 @@ class FaceIndexRepository:
 
         root_path_values = list(dict.fromkeys(str(path) for path in root_paths))
         root_placeholders = ",".join("?" for _ in root_path_values)
-        params: list[object] = [*root_path_values]
+        self._stage_inventory_paths(discovered_paths)
         query = (
             "DELETE FROM photos "
             "WHERE root_id IN (SELECT id FROM photo_roots WHERE path IN (" + root_placeholders + "))"
+            " AND NOT EXISTS (SELECT 1 FROM inventory_paths WHERE inventory_paths.path = photos.path)"
         )
-        if discovered_paths:
-            discovered_values = list(dict.fromkeys(str(path) for path in discovered_paths))
-            discovered_placeholders = ",".join("?" for _ in discovered_values)
-            query += f" AND path NOT IN ({discovered_placeholders})"
-            params.extend(discovered_values)
-
-        cursor = self.connection.execute(query, tuple(params))
+        cursor = self.connection.execute(query, tuple(root_path_values))
         return int(cursor.rowcount)
+
+    def _stage_inventory_paths(self, paths: Sequence[Path]) -> None:
+        # A temporary indexed inventory avoids SQLite's bound-variable limit.
+        self.connection.execute("CREATE TEMP TABLE IF NOT EXISTS inventory_paths (path TEXT PRIMARY KEY)")
+        self.connection.execute("DELETE FROM inventory_paths")
+        self.connection.executemany(
+            "INSERT OR IGNORE INTO inventory_paths(path) VALUES (?)",
+            ((str(path),) for path in paths),
+        )
 
     def mark_photo_processing(self, photo_id: int) -> None:
         self.connection.execute(
@@ -164,21 +165,19 @@ class FaceIndexRepository:
         return {str(row["status"]): int(row["total"]) for row in rows}
 
     def ensure_person(self, display_name: str) -> int:
-        self.connection.execute(
-            "INSERT OR IGNORE INTO reference_people(display_name) VALUES (?)",
-            (display_name,),
-        )
         row = self.connection.execute(
             "SELECT id FROM reference_people WHERE display_name = ?",
             (display_name,),
         ).fetchone()
-        assert row is not None
-        return int(row["id"])
+        if row is not None:
+            return int(row["id"])
+        cursor = self.connection.execute("INSERT INTO reference_people(display_name) VALUES (?)", (display_name,))
+        return int(cursor.lastrowid)
 
     def upsert_reference_image(self, image_path: Path, person_name: str, size_bytes: int, modified_time_ns: int, fingerprint: str) -> tuple[int, bool]:
         person_id = self.ensure_person(person_name)
         row = self.connection.execute(
-            "SELECT id, fingerprint FROM reference_images WHERE path = ?",
+            "SELECT id, person_id, fingerprint, status FROM reference_images WHERE path = ?",
             (str(image_path),),
         ).fetchone()
         if row is None:
@@ -192,10 +191,9 @@ class FaceIndexRepository:
             return int(cursor.lastrowid), True
 
         changed = str(row["fingerprint"]) != fingerprint
-        status = "pending" if changed else self.connection.execute(
-            "SELECT status FROM reference_images WHERE id = ?",
-            (int(row["id"]),),
-        ).fetchone()["status"]
+        if not changed and int(row["person_id"]) == person_id:
+            return int(row["id"]), False
+        status = "pending" if changed else row["status"]
         self.connection.execute(
             """
             UPDATE reference_images
@@ -217,16 +215,11 @@ class FaceIndexRepository:
         return list(self.connection.execute(query, params).fetchall())
 
     def delete_reference_images_missing_from_inventory(self, discovered_paths: Sequence[Path]) -> int:
-        if discovered_paths:
-            discovered_values = [str(path) for path in discovered_paths]
-            placeholders = ",".join("?" for _ in discovered_values)
-            cursor = self.connection.execute(
-                f"DELETE FROM reference_images WHERE path NOT IN ({placeholders})",
-                tuple(discovered_values),
-            )
-        else:
-            cursor = self.connection.execute("DELETE FROM reference_images")
-
+        self._stage_inventory_paths(discovered_paths)
+        cursor = self.connection.execute(
+            "DELETE FROM reference_images WHERE NOT EXISTS "
+            "(SELECT 1 FROM inventory_paths WHERE inventory_paths.path = reference_images.path)"
+        )
         deleted = int(cursor.rowcount)
         self.connection.execute(
             "DELETE FROM reference_people WHERE id NOT IN (SELECT DISTINCT person_id FROM reference_images)"
@@ -300,7 +293,7 @@ class FaceIndexRepository:
         return [unpack_embedding(row["embedding"]) for row in rows]
 
     def iter_photo_faces(self) -> Iterable[tuple[int, Path, tuple[float, float, float, float], np.ndarray]]:
-        rows = self.connection.execute(
+        cursor = self.connection.execute(
             """
             SELECT photo_faces.id, photos.path, photo_faces.bbox_left, photo_faces.bbox_top,
                    photo_faces.bbox_right, photo_faces.bbox_bottom, photo_faces.embedding
@@ -309,8 +302,8 @@ class FaceIndexRepository:
             WHERE photos.status = 'completed'
             ORDER BY photo_faces.id
             """
-        ).fetchall()
-        for row in rows:
+        )
+        for row in cursor:
             yield (
                 int(row["id"]),
                 Path(str(row["path"])),
@@ -361,6 +354,14 @@ class FaceIndexRepository:
             (person_id, photo_face_id),
         ).fetchone()
         return None if row is None else str(row["state"])
+
+    def get_validation_states(self, person_id: int) -> dict[int, str]:
+        return {
+            int(row["photo_face_id"]): str(row["state"])
+            for row in self.connection.execute(
+                "SELECT photo_face_id, state FROM validation_rules WHERE person_id = ?", (person_id,)
+            )
+        }
 
     def save_engine_metadata(self, metadata: dict[str, str]) -> None:
         self.connection.executemany(

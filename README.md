@@ -28,9 +28,27 @@ Cette première implémentation pose le socle technique :
 - auto-préremplissage au premier lancement avec `MesPhotos/`, `Ref/` et un stockage local `.faceid-data/` si ces dossiers existent dans le workspace ;
 - indexation en arrière-plan non bloquante avec barre d'état ;
 - bouton d'annulation de l'indexation ;
-- bouton **Rerun incrémental** (ne traite que les nouveautés/modifications) ;
+- bouton **Actualiser l’index** (ne traite que les nouveautés/modifications) ;
 - compteur temps réel du nombre de visages détectés ;
 - résumé final exporté en UTF-8 dans `last-indexing-summary.json` dans le dossier de stockage.
+
+## Performances et interface
+
+- Recherche NumPy par lots de 256 visages, avec lecture progressive de l’index et récupération groupée des validations.
+- Recherche en arrière-plan : la fenêtre reste réactive pendant la comparaison.
+- InsightFace limité à la détection et aux embeddings de reconnaissance, sans calcul des attributs âge/genre ni des repères 3D inutilisés.
+- Inventaire incrémental sans réécriture des photos et références inchangées ; inventaires volumineux sans limite de paramètres SQLite par fichier.
+- Miniatures décodées à taille réduite lorsque le format le permet, orientation EXIF respectée et cache mémoire limité à 128 images.
+- Journal limité aux 1 500 dernières lignes pour maîtriser la mémoire.
+- Interface claire avec cartes de résultats, chemins abrégés et infobulles, actions activées selon la sélection.
+- Pas de vérification réseau des versions au démarrage ni à la fin de l’indexation. Le bouton **Version du moteur** permet la vérification explicite sur PyPI.
+- Sauvegarde par fichier conservée pour permettre la reprise après interruption.
+
+Les confirmations sont toujours incluses même sous le seuil ; les rejets sont exclus. Le marquage « manuel » seul conserve l’application du seuil.
+
+## Tests
+
+La suite `pytest` couvre l’indexation, la reprise, les validations, les calculs de similarité par lots, les inventaires et l’interface Qt en mode hors écran. Aucun téléchargement de modèle ni accès réseau n’est nécessaire pour ces tests.
 
 ## Lancer le projet
 

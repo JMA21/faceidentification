@@ -37,7 +37,7 @@ class ReferenceIndexer:
             return summary
 
         for image_path in sorted(reference_directory.iterdir()):
-            if not image_path.is_file() or image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            if image_path.suffix.lower() not in IMAGE_EXTENSIONS or not image_path.is_file():
                 continue
             stats = image_path.stat()
             discovered_paths.append(image_path)

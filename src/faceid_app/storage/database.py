@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 DB_FILE_NAME = "faceid-index.sqlite3"
@@ -133,6 +134,7 @@ def connect(database_path: str | Path) -> sqlite3.Connection:
 def initialize_database(database_path: str | Path) -> Path:
     db_path = Path(database_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with connect(db_path) as connection:
-        connection.executescript(SCHEMA)
+    with closing(connect(db_path)) as connection:
+        with connection:
+            connection.executescript(SCHEMA)
     return db_path

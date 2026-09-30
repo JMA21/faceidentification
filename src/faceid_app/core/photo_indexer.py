@@ -50,7 +50,7 @@ class PhotoIndexer:
     def discover(self, root_directories: Sequence[Path]) -> Iterable[tuple[Path, Path]]:
         for root in self._normalize_roots(root_directories):
             for path in root.rglob("*"):
-                if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+                if path.suffix.lower() in IMAGE_EXTENSIONS and path.is_file():
                     yield root, path.resolve(strict=False)
 
     def synchronize_inventory(self, root_directories: Sequence[Path]) -> SyncSummary:

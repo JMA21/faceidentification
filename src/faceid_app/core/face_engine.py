@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from importlib import metadata
 from pathlib import Path
 from typing import Sequence
@@ -60,7 +61,10 @@ def _fetch_pypi_payload(package_name: str) -> dict | None:
 
 
 def _fetch_latest_pypi_version(package_name: str) -> str | None:
-    payload = _fetch_pypi_payload(package_name)
+    return _latest_pypi_version(_fetch_pypi_payload(package_name))
+
+
+def _latest_pypi_version(payload: dict | None) -> str | None:
     info = payload.get("info") if isinstance(payload, dict) else None
     version = info.get("version") if isinstance(info, dict) else None
     return str(version) if version else None
@@ -79,8 +83,13 @@ def _is_python_compatible(requires_python: str | None) -> bool:
     return py_version in spec
 
 
+@lru_cache(maxsize=1)
+def _current_tags() -> frozenset:
+    return frozenset(sys_tags())
+
+
 def _release_has_compatible_file(files: list[dict]) -> bool:
-    current_tags = set(sys_tags())
+    current_tags = _current_tags()
     for file_info in files:
         if not isinstance(file_info, dict):
             continue
@@ -107,14 +116,17 @@ def _release_has_compatible_file(files: list[dict]) -> bool:
 
 
 def _fetch_latest_compatible_version(package_name: str) -> str | None:
-    payload = _fetch_pypi_payload(package_name)
+    return _latest_compatible_version(_fetch_pypi_payload(package_name))
+
+
+def _latest_compatible_version(payload: dict | None) -> str | None:
     if not payload:
         return None
     releases = payload.get("releases")
     if not isinstance(releases, dict):
         return None
 
-    candidates: list[Version] = []
+    candidates: list[tuple[Version, list[dict]]] = []
     for version_str, files in releases.items():
         if not isinstance(files, list) or not files:
             continue
@@ -122,19 +134,20 @@ def _fetch_latest_compatible_version(package_name: str) -> str | None:
             parsed_version = Version(str(version_str))
         except InvalidVersion:
             continue
+        candidates.append((parsed_version, files))
+    for version, files in sorted(candidates, key=lambda item: item[0], reverse=True):
         if _release_has_compatible_file(files):
-            candidates.append(parsed_version)
-
-    if not candidates:
-        return None
-    return str(max(candidates))
+            return str(version)
+    return None
 
 
-def detect_engine_version() -> EngineVersionInfo:
-    latest_package_version = _fetch_latest_pypi_version("insightface")
-    latest_runtime_version = _fetch_latest_pypi_version("onnxruntime")
-    latest_compatible_package_version = _fetch_latest_compatible_version("insightface")
-    latest_compatible_runtime_version = _fetch_latest_compatible_version("onnxruntime")
+def detect_engine_version(*, check_updates: bool = True) -> EngineVersionInfo:
+    package_payload = _fetch_pypi_payload("insightface") if check_updates else None
+    runtime_payload = _fetch_pypi_payload("onnxruntime") if check_updates else None
+    latest_package_version = _latest_pypi_version(package_payload)
+    latest_runtime_version = _latest_pypi_version(runtime_payload)
+    latest_compatible_package_version = _latest_compatible_version(package_payload)
+    latest_compatible_runtime_version = _latest_compatible_version(runtime_payload)
     try:
         package_version = metadata.version("insightface")
         runtime_version = metadata.version("onnxruntime")
@@ -183,8 +196,13 @@ class InsightFaceEngine:
 
         from insightface.app import FaceAnalysis  # type: ignore
 
-        self._app = FaceAnalysis(name=self.model_name, providers=list(self.providers))
-        self._app.prepare(ctx_id=0, det_size=self.det_size)
+        app = FaceAnalysis(
+            name=self.model_name,
+            providers=list(self.providers),
+            allowed_modules=["detection", "recognition"],
+        )
+        app.prepare(ctx_id=0, det_size=self.det_size)
+        self._app = app
 
     def extract_faces(self, image_path: Path) -> list[FaceDetection]:
         self.prepare()
@@ -193,7 +211,7 @@ class InsightFaceEngine:
         with Image.open(image_path) as image:
             rgb = image.convert("RGB")
             image_array = np.array(rgb)
-        bgr = image_array[:, :, ::-1]
+        bgr = np.ascontiguousarray(image_array[:, :, ::-1])
 
         faces = self._app.get(bgr)
         detections: list[FaceDetection] = []
